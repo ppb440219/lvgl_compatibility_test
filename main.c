@@ -10,6 +10,21 @@
 #include <sys/mman.h>
 #include <time.h>
 
+#define UI_WIDTH 720
+#define UI_HEIGHT 1280
+
+#ifndef USE_NV12
+#define USE_NV12 1
+#endif
+
+#if USE_NV12
+#define DISPLAY_FORMAT DRM_FORMAT_NV12
+#define DISPLAY_FORMAT_NAME "NV12"
+#else
+#define DISPLAY_FORMAT DRM_FORMAT_XRGB8888
+#define DISPLAY_FORMAT_NAME "XRGB8888"
+#endif
+
 typedef struct {
     int fd;
     uint32_t conn_id;
@@ -20,16 +35,16 @@ typedef struct {
 
     uint32_t width;
     uint32_t height;
-    uint32_t stride;     // 對齊後的每行 byte 數 (600 對齊為 608)
-    uint32_t y_size;     // stride * height (608 * 1024 = 622592)
+    uint32_t stride;     // DRM 回傳的每行 byte 數
+    uint32_t y_size;     // NV12: stride * height
     uint32_t uv_size;    // stride * (height / 2)
     uint32_t total_size; // y_size + uv_size
     uint32_t handle;
     uint32_t fb_id;
-    uint8_t * map;       // 指向 NV12 連續記憶體 (map = Y, map + y_size = UV)
-} drm_nv12_ctx_t;
+    uint8_t * map;       // NV12 或 XRGB8888 framebuffer
+} app_drm_ctx_t;
 
-static drm_nv12_ctx_t g_drm = {0};
+static app_drm_ctx_t g_drm = {0};
 static uint8_t * g_lvgl_rgb_buf = NULL; // LVGL 繪製用的 XRGB8888 緩衝區
 static lv_obj_t * vol_label;
 
@@ -61,10 +76,11 @@ static uint32_t get_prop_id(int fd, uint32_t obj_id, uint32_t obj_type, const ch
 }
 
 /* 高速整數運算：將 LVGL 的 XRGB8888 畫面轉換為硬體所需的 NV12 (Y + UV 雙平面) */
-static void convert_xrgb8888_to_nv12(const uint8_t * src_xrgb, uint8_t * dst_nv12, uint32_t width, uint32_t height, uint32_t dst_stride)
+#if USE_NV12
+static void convert_xrgb8888_to_nv12(const uint8_t * src_xrgb, uint8_t * dst_nv12, uint32_t width, uint32_t height, uint32_t dst_height, uint32_t dst_stride)
 {
     uint8_t * dst_y = dst_nv12;
-    uint8_t * dst_uv = dst_nv12 + (dst_stride * height);
+    uint8_t * dst_uv = dst_nv12 + (dst_stride * dst_height);
     const uint32_t * src32 = (const uint32_t *)src_xrgb;
 
     for (uint32_t y = 0; y < height; y += 2) {
@@ -99,9 +115,10 @@ static void convert_xrgb8888_to_nv12(const uint8_t * src_xrgb, uint8_t * dst_nv1
         }
     }
 }
+#endif
 
-/* 初始化 NV12 DRM Atomic 顯示管線 */
-static int init_drm_nv12(const char * dev_path)
+/* 初始化 DRM Atomic 顯示管線 */
+static int init_drm(const char * dev_path)
 {
     g_drm.fd = open(dev_path, O_RDWR | O_CLOEXEC);
     if (g_drm.fd < 0) {
@@ -132,6 +149,13 @@ static int init_drm_nv12(const char * dev_path)
         drmModeFreeResources(res);
         return -1;
     }
+    if (g_drm.width < UI_WIDTH || g_drm.height < UI_HEIGHT) {
+        fprintf(stderr, "ERROR: Display mode %ux%u is smaller than UI canvas %ux%u\n",
+                g_drm.width, g_drm.height, UI_WIDTH, UI_HEIGHT);
+        drmModeFreeConnector(conn);
+        drmModeFreeResources(res);
+        return -1;
+    }
 
     uint32_t crtc_index = 0;
     if (conn->encoder_id) {
@@ -151,7 +175,7 @@ static int init_drm_nv12(const char * dev_path)
     drmModeFreeConnector(conn);
     drmModeFreeResources(res);
 
-    /* 尋找支援此 CRTC 且支援 DRM_FORMAT_NV12 的 Plane */
+    /* 尋找支援此 CRTC 與輸出格式的 Plane */
     drmModePlaneRes * plane_res = drmModeGetPlaneResources(g_drm.fd);
     if (!plane_res) return -1;
 
@@ -161,7 +185,7 @@ static int init_drm_nv12(const char * dev_path)
 
         if (plane->possible_crtcs & (1 << crtc_index)) {
             for (uint32_t f = 0; f < plane->count_formats; f++) {
-                if (plane->formats[f] == DRM_FORMAT_NV12) {
+                if (plane->formats[f] == DISPLAY_FORMAT) {
                     g_drm.plane_id = plane->plane_id;
                     break;
                 }
@@ -173,13 +197,14 @@ static int init_drm_nv12(const char * dev_path)
     drmModeFreePlaneResources(plane_res);
 
     if (!g_drm.plane_id) {
-        printf("ERROR: No plane supporting NV12 found!\n");
+        fprintf(stderr, "ERROR: No plane supporting %s found!\n", DISPLAY_FORMAT_NAME);
         return -1;
     }
 
-    printf("NV12 DRM Pipeline Locked: Connector=%u, CRTC=%u, NV12_Plane=%u (%ux%u)\n",
-           g_drm.conn_id, g_drm.crtc_id, g_drm.plane_id, g_drm.width, g_drm.height);
+    printf("%s DRM Pipeline Locked: Connector=%u, CRTC=%u, Plane=%u (%ux%u)\n",
+           DISPLAY_FORMAT_NAME, g_drm.conn_id, g_drm.crtc_id, g_drm.plane_id, g_drm.width, g_drm.height);
 
+#if USE_NV12
     /* 關鍵修正：SigmaStar sstar_drm 要求寬度/stride 必須 16-byte 對齊 (600 -> 608) */
     uint32_t aligned_width = (g_drm.width + 15) & ~15;
 
@@ -188,24 +213,36 @@ static int init_drm_nv12(const char * dev_path)
         .height = g_drm.height * 3 / 2,
         .bpp = 8,
     };
+#else
+    struct drm_mode_create_dumb creq = {
+        .width = g_drm.width,
+        .height = g_drm.height,
+        .bpp = 32,
+    };
+#endif
     if (drmIoctl(g_drm.fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
         perror("DRM_IOCTL_MODE_CREATE_DUMB failed");
         return -1;
     }
-    g_drm.stride = creq.pitch; // 608
-    g_drm.y_size = g_drm.stride * g_drm.height; // 608 * 1024 = 622592
+    g_drm.stride = creq.pitch;
+#if USE_NV12
+    g_drm.y_size = g_drm.stride * g_drm.height;
     g_drm.uv_size = g_drm.stride * (g_drm.height / 2);
+#endif
     g_drm.total_size = creq.size;
     g_drm.handle = creq.handle;
 
-    /* NV12 需要設定雙平面參數：Plane 0 = Y, Plane 1 = UV */
-    uint32_t handles[4] = { g_drm.handle, g_drm.handle, 0, 0 };
-    uint32_t pitches[4] = { g_drm.stride, g_drm.stride, 0, 0 };
-    uint32_t offsets[4] = { 0, g_drm.y_size, 0, 0 };
-
-    if (drmModeAddFB2(g_drm.fd, g_drm.width, g_drm.height, DRM_FORMAT_NV12,
+    uint32_t handles[4] = { g_drm.handle, 0, 0, 0 };
+    uint32_t pitches[4] = { g_drm.stride, 0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
+#if USE_NV12
+    handles[1] = g_drm.handle;
+    pitches[1] = g_drm.stride;
+    offsets[1] = g_drm.y_size;
+#endif
+    if (drmModeAddFB2(g_drm.fd, g_drm.width, g_drm.height, DISPLAY_FORMAT,
                       handles, pitches, offsets, &g_drm.fb_id, 0) != 0) {
-        perror("drmModeAddFB2 (NV12) failed");
+        perror("drmModeAddFB2 failed");
         return -1;
     }
 
@@ -222,10 +259,14 @@ static int init_drm_nv12(const char * dev_path)
     }
 
     /* 初始化為純黑畫面 (NV12 的純黑為 Y=16, UV=128) */
+#if USE_NV12
     memset(g_drm.map, 16, g_drm.y_size);
     memset(g_drm.map + g_drm.y_size, 128, g_drm.uv_size);
+#else
+    memset(g_drm.map, 0, g_drm.total_size);
+#endif
 
-    /* 執行 Atomic Commit 綁定 NV12 Plane */
+    /* 執行 Atomic Commit 綁定 Plane */
     drmModeCreatePropertyBlob(g_drm.fd, &g_drm.mode, sizeof(g_drm.mode), &g_drm.mode_blob_id);
 
     drmModeAtomicReq * req = drmModeAtomicAlloc();
@@ -248,21 +289,28 @@ static int init_drm_nv12(const char * dev_path)
     drmModeAtomicFree(req);
 
     if (ret != 0) {
-        perror("NV12 drmModeAtomicCommit failed");
+        perror("drmModeAtomicCommit failed");
         return -1;
     }
-    printf("NV12 DRM Atomic Modeset SUCCESS! (stride=%u, y_size=%u)\n", g_drm.stride, g_drm.y_size);
+    printf("%s DRM Atomic Modeset SUCCESS! (stride=%u)\n", DISPLAY_FORMAT_NAME, g_drm.stride);
     return 0;
 }
 
-/* LVGL 畫面刷新回呼：轉檔為 NV12 並透過 Atomic Commit 輸出 */
-static void drm_nv12_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map)
+/* LVGL 畫面刷新回呼 */
+static void drm_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map)
 {
     (void)area;
     (void)px_map;
 
     if (lv_display_flush_is_last(disp)) {
-        convert_xrgb8888_to_nv12(g_lvgl_rgb_buf, g_drm.map, g_drm.width, g_drm.height, g_drm.stride);
+#if USE_NV12
+        convert_xrgb8888_to_nv12(g_lvgl_rgb_buf, g_drm.map, UI_WIDTH, UI_HEIGHT, g_drm.height, g_drm.stride);
+#else
+        for (uint32_t y = 0; y < UI_HEIGHT; y++) {
+            memcpy(g_drm.map + (size_t)y * g_drm.stride,
+                   g_lvgl_rgb_buf + (size_t)y * UI_WIDTH * 4, UI_WIDTH * 4);
+        }
+#endif
         drmModeAtomicReq * req = drmModeAtomicAlloc();
         drmModeAtomicAddProperty(req, g_drm.plane_id, get_prop_id(g_drm.fd, g_drm.plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID"), g_drm.fb_id);
         drmModeAtomicCommit(g_drm.fd, req, 0, NULL);
@@ -290,15 +338,22 @@ static void btn_event_cb(lv_event_t * e)
     }
 }
 
-int main(void)
+int main(int argc, char ** argv)
 {
-    /* 1. 初始化 NV12 DRM Atomic 顯示管線 */
-    if (init_drm_nv12("/dev/dri/card0") != 0) {
+    if (argc > 3) {
+        fprintf(stderr, "Usage: %s [DRM_DEVICE [TOUCH_DEVICE]]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    const char * drm_device = argc > 1 ? argv[1] : "/dev/dri/card0";
+    const char * touch_device = argc > 2 ? argv[2] : "/dev/input/event1";
+
+    /* 1. 初始化 DRM Atomic 顯示管線 */
+    if (init_drm(drm_device) != 0) {
         return -1;
     }
 
     /* 2. 為 LVGL 配置獨立的 XRGB8888 繪圖緩衝區 */
-    size_t rgb_buf_size = g_drm.width * g_drm.height * 4;
+    size_t rgb_buf_size = UI_WIDTH * UI_HEIGHT * 4;
     g_lvgl_rgb_buf = malloc(rgb_buf_size);
     if (!g_lvgl_rgb_buf) {
         printf("Failed to allocate LVGL RGB buffer\n");
@@ -307,11 +362,17 @@ int main(void)
 
     lv_init();
     lv_tick_set_cb(custom_tick_get);
-    lv_display_t * disp = lv_display_create(g_drm.width, g_drm.height);
-    lv_display_set_flush_cb(disp, drm_nv12_flush_cb);
+    lv_display_t * disp = lv_display_create(UI_WIDTH, UI_HEIGHT);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_XRGB8888);
+    lv_display_set_flush_cb(disp, drm_flush_cb);
     lv_display_set_buffers(disp, g_lvgl_rgb_buf, NULL, rgb_buf_size, LV_DISPLAY_RENDER_MODE_DIRECT);
+
     /* 3. 初始化觸控螢幕 (/dev/input/event1 -> fts_ts) */
-    lv_evdev_create(LV_INDEV_TYPE_POINTER, "/dev/input/event1");
+    if (!lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_device)) {
+        fprintf(stderr, "Failed to initialize touch device: %s\n", touch_device);
+        return EXIT_FAILURE;
+    }
+
     /* 4. 建立測試介面 */
     lv_obj_t * scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1E1E2E), 0);

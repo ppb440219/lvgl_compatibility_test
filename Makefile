@@ -4,14 +4,31 @@ TARGET = audiobox_gui
 # 編譯器設定：直接使用 Yocto SDK 匯出的 $(CC)，若未載入環境則預設 gcc
 CC ?= gcc
 
+# sstar: Yocto SDK / NV12; rpi: native Raspberry Pi / XRGB8888
+PLATFORM ?= sstar
+ifeq ($(PLATFORM),sstar)
+    CPPFLAGS += -DUSE_NV12=1
+else ifeq ($(PLATFORM),rpi)
+    CPPFLAGS += -DUSE_NV12=0
+else
+    $(error Unsupported PLATFORM '$(PLATFORM)'; use sstar or rpi)
+endif
+
 # 專案與 LVGL 路徑
-# LVGL 原始碼為共享目錄，可用 `make LVGL_DIR=/path/to/lvgl` 覆寫
-LVGL_DIR ?= $(HOME)/projects/lvgl
-BUILD_DIR = build
+LVGL_DIR := $(CURDIR)/lvgl
+BUILD_DIR = build/$(PLATFORM)
+
+ifeq ($(wildcard $(LVGL_DIR)/lvgl.h),)
+ifneq ($(MAKECMDGOALS),clean)
+    $(error LVGL submodule is missing; run 'git submodule update --init --recursive')
+endif
+else
+    LVGL_SRCS := $(shell find "$(LVGL_DIR)/src" -name "*.c")
+endif
 
 # 編譯參數：
 #   -I.                      尋找 lv_conf.h
-#   -I$(dir $(LVGL_DIR))     讓 main.c 的 #include "lvgl/lvgl.h" 可以找到共享的 lvgl 目錄
+#   -I$(dir $(LVGL_DIR))     讓 main.c 的 #include "lvgl/lvgl.h" 可以找到 LVGL
 #   -I$(LVGL_DIR)            LVGL 內部標頭
 INC = -I. -I$(patsubst %/,%,$(dir $(LVGL_DIR))) -I$(LVGL_DIR)
 ifneq ($(OECORE_TARGET_SYSROOT),)
@@ -27,16 +44,16 @@ LDFLAGS += -ldrm -lm -lpthread
 CSRCS = main.c
 COBJS = $(patsubst %.c, $(BUILD_DIR)/%.o, $(CSRCS))
 
-# 自動遞迴尋找共享 lvgl/src 下的所有 .c 檔案，
-# 其 .o 另外對應到 build/lvgl/ 底下，避免寫入共享的 LVGL 目錄
-LVGL_SRCS = $(shell find $(LVGL_DIR)/src -name "*.c")
 LVGL_OBJS = $(patsubst $(LVGL_DIR)/%.c, $(BUILD_DIR)/lvgl/%.o, $(LVGL_SRCS))
 
 OBJS = $(COBJS) $(LVGL_OBJS)
 
-.PHONY: all clean
+.PHONY: all clean $(TARGET)
 
 all: $(TARGET)
+
+# Makefile 變更時重編，避免沿用切換 LVGL 路徑前的物件檔
+$(OBJS): Makefile
 
 $(TARGET): $(OBJS)
 	@echo "Linking $@..."
@@ -45,11 +62,11 @@ $(TARGET): $(OBJS)
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/lvgl/%.o: $(LVGL_DIR)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
