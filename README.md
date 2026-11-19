@@ -7,7 +7,6 @@
    1. fetch code:
       - git clone git@github.com:ppb440219/lvgl_compatibility_test.git
       - cd lvgl_compatibility_test & git submodule update --init --recursive
-   1. sudo apt install build-essential git libdrm-dev libevdev-dev
-   1. clone project into rpi5
+   2. sudo apt install build-essential git libdrm-dev libevdev-dev
    3. make PLATFORM=rpi
    4. execution: 'sudo ./audiobox_gui /dev/dri/card1 /dev/input/event0'
