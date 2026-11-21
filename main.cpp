@@ -44,7 +44,7 @@ typedef struct {
     uint8_t * map;       // NV12 或 XRGB8888 framebuffer
 } app_drm_ctx_t;
 
-static app_drm_ctx_t g_drm = {0};
+static app_drm_ctx_t g_drm = {};
 static uint8_t * g_lvgl_rgb_buf = NULL; // LVGL 繪製用的 XRGB8888 緩衝區
 static lv_obj_t * vol_label;
 
@@ -81,7 +81,7 @@ static void convert_xrgb8888_to_nv12(const uint8_t * src_xrgb, uint8_t * dst_nv1
 {
     uint8_t * dst_y = dst_nv12;
     uint8_t * dst_uv = dst_nv12 + (dst_stride * dst_height);
-    const uint32_t * src32 = (const uint32_t *)src_xrgb;
+    const uint32_t * src32 = reinterpret_cast<const uint32_t *>(src_xrgb);
 
     for (uint32_t y = 0; y < height; y += 2) {
         const uint32_t * row0 = src32 + y * width;
@@ -208,17 +208,15 @@ static int init_drm(const char * dev_path)
     /* 關鍵修正：SigmaStar sstar_drm 要求寬度/stride 必須 16-byte 對齊 (600 -> 608) */
     uint32_t aligned_width = (g_drm.width + 15) & ~15;
 
-    struct drm_mode_create_dumb creq = {
-        .width = aligned_width,
-        .height = g_drm.height * 3 / 2,
-        .bpp = 8,
-    };
+    struct drm_mode_create_dumb creq = {};
+    creq.width = aligned_width;
+    creq.height = g_drm.height * 3 / 2;
+    creq.bpp = 8;
 #else
-    struct drm_mode_create_dumb creq = {
-        .width = g_drm.width,
-        .height = g_drm.height,
-        .bpp = 32,
-    };
+    struct drm_mode_create_dumb creq = {};
+    creq.width = g_drm.width;
+    creq.height = g_drm.height;
+    creq.bpp = 32;
 #endif
     if (drmIoctl(g_drm.fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
         perror("DRM_IOCTL_MODE_CREATE_DUMB failed");
@@ -246,13 +244,14 @@ static int init_drm(const char * dev_path)
         return -1;
     }
 
-    struct drm_mode_map_dumb mreq = { .handle = g_drm.handle };
+    struct drm_mode_map_dumb mreq = {};
+    mreq.handle = g_drm.handle;
     if (drmIoctl(g_drm.fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
         perror("DRM_IOCTL_MODE_MAP_DUMB failed");
         return -1;
     }
 
-    g_drm.map = mmap(0, g_drm.total_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_drm.fd, mreq.offset);
+    g_drm.map = static_cast<uint8_t *>(mmap(0, g_drm.total_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_drm.fd, mreq.offset));
     if (g_drm.map == MAP_FAILED) {
         perror("mmap failed");
         return -1;
@@ -322,14 +321,14 @@ static void drm_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * 
 /* UI 互動事件 */
 static void slider_event_cb(lv_event_t * e)
 {
-    lv_obj_t * slider = lv_event_get_target(e);
+    lv_obj_t * slider = static_cast<lv_obj_t *>(lv_event_get_target(e));
     int32_t val = lv_slider_get_value(slider);
     lv_label_set_text_fmt(vol_label, "Volume: %d%%", (int)val);    
 }
 
 static void btn_event_cb(lv_event_t * e)
 {
-    lv_obj_t * btn = lv_event_get_target(e);
+    lv_obj_t * btn = static_cast<lv_obj_t *>(lv_event_get_target(e));
     lv_obj_t * label = lv_obj_get_child(btn, 0);
     if (lv_obj_has_state(btn, LV_STATE_CHECKED)) {
     lv_label_set_text(label, "MUTED");
@@ -347,6 +346,9 @@ int main(int argc, char ** argv)
     const char * drm_device = argc > 1 ? argv[1] : "/dev/dri/card0";
     const char * touch_device = argc > 2 ? argv[2] : "/dev/input/event1";
 
+    printf("DRM Device: %s\n", drm_device);
+    printf("Touch Device: %s\n", touch_device);
+
     /* 1. 初始化 DRM Atomic 顯示管線 */
     if (init_drm(drm_device) != 0) {
         return -1;
@@ -354,7 +356,7 @@ int main(int argc, char ** argv)
 
     /* 2. 為 LVGL 配置獨立的 XRGB8888 繪圖緩衝區 */
     size_t rgb_buf_size = UI_WIDTH * UI_HEIGHT * 4;
-    g_lvgl_rgb_buf = malloc(rgb_buf_size);
+    g_lvgl_rgb_buf = static_cast<uint8_t *>(malloc(rgb_buf_size));
     if (!g_lvgl_rgb_buf) {
         printf("Failed to allocate LVGL RGB buffer\n");
         return -1;

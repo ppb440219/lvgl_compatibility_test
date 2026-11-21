@@ -1,8 +1,9 @@
 # 執行檔名稱
 TARGET = audiobox_gui
 
-# 編譯器設定：直接使用 Yocto SDK 匯出的 $(CC)，若未載入環境則預設 gcc
+# 編譯器設定：使用 Yocto SDK 的 CC/CXX，或本機的 C/C++ 編譯器
 CC ?= gcc
+CXX ?= g++
 
 # sstar: Yocto SDK / NV12; rpi: native Raspberry Pi / XRGB8888
 PLATFORM ?= sstar
@@ -28,7 +29,7 @@ endif
 
 # 編譯參數：
 #   -I.                      尋找 lv_conf.h
-#   -I$(dir $(LVGL_DIR))     讓 main.c 的 #include "lvgl/lvgl.h" 可以找到 LVGL
+#   -I$(dir $(LVGL_DIR))     讓 main.cpp 的 #include "lvgl/lvgl.h" 可以找到 LVGL
 #   -I$(LVGL_DIR)            LVGL 內部標頭
 INC = -I. -I$(patsubst %/,%,$(dir $(LVGL_DIR))) -I$(LVGL_DIR)
 ifneq ($(OECORE_TARGET_SYSROOT),)
@@ -37,16 +38,18 @@ else
     INC += -I/usr/include/libdrm
 endif
 
-CFLAGS += -O2 -Wall -Wextra $(INC) -DLV_CONF_INCLUDE_SIMPLE
+CPPFLAGS += $(INC) -DLV_CONF_INCLUDE_SIMPLE
+CFLAGS += -O2 -Wall -Wextra
+CXXFLAGS += -O2 -Wall -Wextra
 LDFLAGS += -ldrm -lm -lpthread
 
 # 專案本身的原始碼
-CSRCS = main.c
-COBJS = $(patsubst %.c, $(BUILD_DIR)/%.o, $(CSRCS))
+CXXSRCS = main.cpp
+CXXOBJS = $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(CXXSRCS))
 
 LVGL_OBJS = $(patsubst $(LVGL_DIR)/%.c, $(BUILD_DIR)/lvgl/%.o, $(LVGL_SRCS))
 
-OBJS = $(COBJS) $(LVGL_OBJS)
+OBJS = $(CXXOBJS) $(LVGL_OBJS)
 
 .PHONY: all clean $(TARGET)
 
@@ -57,12 +60,12 @@ $(OBJS): Makefile
 
 $(TARGET): $(OBJS)
 	@echo "Linking $@..."
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 
-$(BUILD_DIR)/%.o: %.c
+$(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/lvgl/%.o: $(LVGL_DIR)/%.c
 	@mkdir -p $(dir $@)
