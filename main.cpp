@@ -10,9 +10,6 @@
 #include <sys/mman.h>
 #include <time.h>
 
-#define UI_WIDTH 720
-#define UI_HEIGHT 1280
-
 #ifndef USE_NV12
 #define USE_NV12 1
 #endif
@@ -35,10 +32,12 @@ typedef struct {
 
     uint32_t width;
     uint32_t height;
-    uint32_t stride;     // DRM 回傳的每行 byte 數
-    uint32_t y_size;     // NV12: stride * height
-    uint32_t uv_size;    // stride * (height / 2)
-    uint32_t total_size; // y_size + uv_size
+    uint32_t stride;
+#if USE_NV12
+    uint32_t y_size;
+    uint32_t uv_size;
+#endif
+    uint32_t total_size;
     uint32_t handle;
     uint32_t fb_id;
     uint8_t * map;       // NV12 或 XRGB8888 framebuffer
@@ -77,10 +76,10 @@ static uint32_t get_prop_id(int fd, uint32_t obj_id, uint32_t obj_type, const ch
 
 /* 高速整數運算：將 LVGL 的 XRGB8888 畫面轉換為硬體所需的 NV12 (Y + UV 雙平面) */
 #if USE_NV12
-static void convert_xrgb8888_to_nv12(const uint8_t * src_xrgb, uint8_t * dst_nv12, uint32_t width, uint32_t height, uint32_t dst_height, uint32_t dst_stride)
+static void convert_xrgb8888_to_nv12(const uint8_t * src_xrgb, uint8_t * dst_nv12, uint32_t width, uint32_t height, uint32_t dst_stride)
 {
     uint8_t * dst_y = dst_nv12;
-    uint8_t * dst_uv = dst_nv12 + (dst_stride * dst_height);
+    uint8_t * dst_uv = dst_nv12 + (dst_stride * height);
     const uint32_t * src32 = reinterpret_cast<const uint32_t *>(src_xrgb);
 
     for (uint32_t y = 0; y < height; y += 2) {
@@ -146,13 +145,6 @@ static int init_drm(const char * dev_path)
         conn = NULL;
     }
     if (!conn) {
-        drmModeFreeResources(res);
-        return -1;
-    }
-    if (g_drm.width < UI_WIDTH || g_drm.height < UI_HEIGHT) {
-        fprintf(stderr, "ERROR: Display mode %ux%u is smaller than UI canvas %ux%u\n",
-                g_drm.width, g_drm.height, UI_WIDTH, UI_HEIGHT);
-        drmModeFreeConnector(conn);
         drmModeFreeResources(res);
         return -1;
     }
@@ -303,11 +295,12 @@ static void drm_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * 
 
     if (lv_display_flush_is_last(disp)) {
 #if USE_NV12
-        convert_xrgb8888_to_nv12(g_lvgl_rgb_buf, g_drm.map, UI_WIDTH, UI_HEIGHT, g_drm.height, g_drm.stride);
+        convert_xrgb8888_to_nv12(g_lvgl_rgb_buf, g_drm.map, g_drm.width, g_drm.height, g_drm.stride);
 #else
-        for (uint32_t y = 0; y < UI_HEIGHT; y++) {
-            memcpy(g_drm.map + (size_t)y * g_drm.stride,
-                   g_lvgl_rgb_buf + (size_t)y * UI_WIDTH * 4, UI_WIDTH * 4);
+        for (uint32_t y = 0; y < g_drm.height; y++) {
+            memcpy(g_drm.map + static_cast<size_t>(y) * g_drm.stride,
+                   g_lvgl_rgb_buf + static_cast<size_t>(y) * g_drm.width * 4,
+                   static_cast<size_t>(g_drm.width) * 4);
         }
 #endif
         drmModeAtomicReq * req = drmModeAtomicAlloc();
@@ -355,7 +348,7 @@ int main(int argc, char ** argv)
     }
 
     /* 2. 為 LVGL 配置獨立的 XRGB8888 繪圖緩衝區 */
-    size_t rgb_buf_size = UI_WIDTH * UI_HEIGHT * 4;
+    size_t rgb_buf_size = g_drm.width * g_drm.height * 4;
     g_lvgl_rgb_buf = static_cast<uint8_t *>(malloc(rgb_buf_size));
     if (!g_lvgl_rgb_buf) {
         printf("Failed to allocate LVGL RGB buffer\n");
@@ -364,17 +357,12 @@ int main(int argc, char ** argv)
 
     lv_init();
     lv_tick_set_cb(custom_tick_get);
-    lv_display_t * disp = lv_display_create(UI_WIDTH, UI_HEIGHT);
+    lv_display_t * disp = lv_display_create(g_drm.width, g_drm.height);
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_XRGB8888);
     lv_display_set_flush_cb(disp, drm_flush_cb);
     lv_display_set_buffers(disp, g_lvgl_rgb_buf, NULL, rgb_buf_size, LV_DISPLAY_RENDER_MODE_DIRECT);
-
     /* 3. 初始化觸控螢幕 (/dev/input/event1 -> fts_ts) */
-    if (!lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_device)) {
-        fprintf(stderr, "Failed to initialize touch device: %s\n", touch_device);
-        return EXIT_FAILURE;
-    }
-
+    lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_device);
     /* 4. 建立測試介面 */
     lv_obj_t * scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1E1E2E), 0);
